@@ -33,6 +33,7 @@ class AudiobookSection(QWidget):
         self._folder = folder
         self._root   = root
         self._dur_worker: DurationWorker | None = None
+        self._restore_tracks: "list[dict] | None" = None
         self._build_ui()
         self._load()
 
@@ -170,6 +171,8 @@ class AudiobookSection(QWidget):
     def _after_table_change(self):
         n = self.table.rowCount()
         if n == 0:
+            # Snapshot tracks so undo can restore them together with the section
+            self._restore_tracks = self.table.take_last_undo_snapshot()
             self.delete_requested.emit(self)
             return
         needs_expand = n > self._COLLAPSED_ROWS

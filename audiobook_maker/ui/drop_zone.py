@@ -5,7 +5,6 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
-    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -16,7 +15,7 @@ from i18n import tr, _tr_loaded
 
 
 class DropZone(QFrame):
-    folder_dropped = pyqtSignal(Path)
+    folders_dropped = pyqtSignal(list)  # list[Path]
 
     def __init__(self):
         super().__init__()
@@ -31,7 +30,6 @@ class DropZone(QFrame):
         self._set_state("idle")
 
         row = QHBoxLayout(self)
-        # Right margin 38 = 18 (visual padding) + 20 (compensates for main layout's 0 right margin)
         row.setContentsMargins(20, 10, 30, 10)
         row.setSpacing(16)
 
@@ -55,14 +53,29 @@ class DropZone(QFrame):
         self.style().unpolish(self)
         self.style().polish(self)
 
-    def set_loaded(self, name: str, n_books: int, n_tracks: int):
-        self._loaded_name = name
+    def set_loaded(self, first_name: str, n_books: int, n_tracks: int, extra: int = 0):
+        self._loaded_name = first_name
         self._loaded_n_books = n_books
         self._loaded_n_tracks = n_tracks
         self._icon.setText("📂")
-        self._line1.setText(name)
+        title = f"{first_name}  etc." if extra > 0 else first_name
+        self._line1.setText(title)
         self._line2.setText(_tr_loaded(n_books, n_tracks))
         self._set_state("loaded")
+
+    def update_counts(self, n_books: int, n_tracks: int):
+        self._loaded_n_books = n_books
+        self._loaded_n_tracks = n_tracks
+        self._line2.setText(_tr_loaded(n_books, n_tracks))
+
+    def reset(self):
+        self._loaded_name = None
+        self._loaded_n_books = 0
+        self._loaded_n_tracks = 0
+        self._icon.setText("📁")
+        self._line1.setText(tr("drag_hint"))
+        self._line2.setText(tr("drop_sub"))
+        self._set_state("idle")
 
     def retheme(self):
         self._set_state("loaded" if self._loaded_name is not None else "idle")
@@ -75,14 +88,26 @@ class DropZone(QFrame):
             self._line2.setText(tr("drop_sub"))
 
     def mousePressEvent(self, _event):
-        start = self._dir_hint() if self._dir_hint else ""
-        folder = QFileDialog.getExistingDirectory(self, "Select audiobook folder", start)
-        if folder:
-            self.folder_dropped.emit(Path(folder))
+        import subprocess
+        script = (
+            'set folderList to choose folder with multiple selections allowed\n'
+            'set out to ""\n'
+            'repeat with f in folderList\n'
+            '    set out to out & POSIX path of f & "\\n"\n'
+            'end repeat\n'
+            'out'
+        )
+        result = subprocess.run(['osascript', '-e', script],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            folders = [Path(p) for p in result.stdout.strip().splitlines()
+                       if p.strip() and Path(p.strip()).is_dir()]
+            if folders:
+                self.folders_dropped.emit(folders)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         urls = event.mimeData().urls()
-        if urls and Path(urls[0].toLocalFile()).is_dir():
+        if any(Path(u.toLocalFile()).is_dir() for u in urls):
             event.acceptProposedAction()
             self._set_state("hover")
 
@@ -92,8 +117,7 @@ class DropZone(QFrame):
     def dropEvent(self, event: QDropEvent):
         self.retheme()
         urls = event.mimeData().urls()
-        if urls:
-            folder = Path(urls[0].toLocalFile())
-            if folder.is_dir():
-                event.acceptProposedAction()
-                self.folder_dropped.emit(folder)
+        folders = [Path(u.toLocalFile()) for u in urls if Path(u.toLocalFile()).is_dir()]
+        if folders:
+            event.acceptProposedAction()
+            self.folders_dropped.emit(folders)

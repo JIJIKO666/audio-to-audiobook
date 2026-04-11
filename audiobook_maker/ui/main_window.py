@@ -43,8 +43,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Audiobook Maker")
         self.setMinimumSize(700, 100)
         self._sections: list[AudiobookSection] = []
-        self._sec_undo: list[tuple[float, AudiobookSection, int]] = []
-        self._sec_redo: list[tuple[float, AudiobookSection, int]] = []
+        # Each entry: (timestamp, [(section, original_idx, restore_tracks)], in_ui)
+        # in_ui=True  → sections are currently in the UI; undo removes them
+        # in_ui=False → sections are currently hidden;   undo restores them
+        self._sec_undo: list[tuple[float, list, bool]] = []
+        self._sec_redo: list[tuple[float, list, bool]] = []
         self._conv_worker: ConvertWorker | None = None
         self._progress: _ProgressDialog | None = None
         self._build_ui()
@@ -67,7 +70,7 @@ class MainWindow(QMainWindow):
 
         # Drop zone (always visible) — wrapped to add its own horizontal margin
         self.drop_zone = DropZone()
-        self.drop_zone.folder_dropped.connect(self.load_folder)
+        self.drop_zone.folders_dropped.connect(self.load_folders)
         self.drop_zone._dir_hint = lambda: self.edit_out.text()
         _dz_wrap = QWidget()
         _dz_lay = QHBoxLayout(_dz_wrap)
@@ -357,25 +360,42 @@ class MainWindow(QMainWindow):
 
     # ── Folder loading ────────────────────────────────────────────────────────
 
-    def load_folder(self, folder: Path):
+    def load_folders(self, folders: "list[Path]"):
         self._clear_sections()
 
-        dirs = find_audiobook_dirs(folder)
-        if not dirs:
-            QMessageBox.warning(self, tr("no_audio"), _tr_no_audio(str(folder)))
+        # Collect all audiobook dirs across all dropped folders
+        all_dirs: list[tuple[Path, Path]] = []  # (dir, root)
+        for folder in folders:
+            for d in find_audiobook_dirs(folder):
+                all_dirs.append((d, folder))
+
+        if not all_dirs:
+            label = folders[0].name if len(folders) == 1 else str(folders[0])
+            QMessageBox.warning(self, tr("no_audio"), _tr_no_audio(label))
             return
 
-        for i, d in enumerate(dirs):
+        batch_entries = []
+        for i, (d, root) in enumerate(all_dirs):
             if i > 0:
                 self._sections_lay.addWidget(_separator())
-            section = AudiobookSection(d, folder)
+            section = AudiobookSection(d, root)
             section.delete_requested.connect(self._delete_section)
+            section.table.tracks_changed.connect(self._on_tracks_changed)
             self._sections_lay.addWidget(section)
             self._sections.append(section)
+            batch_entries.append((section, i, None))
 
-        n_books  = len(dirs)
-        n_tracks = sum(len(get_direct_audio(d)) for d in dirs)
-        self.drop_zone.set_loaded(folder.name, n_books, n_tracks)
+        # Push whole import as one atomic undo entry (in_ui=True)
+        self._sec_undo.append((time.monotonic(), batch_entries, True))
+        # Reset table/cover timestamps so undo picks the import, not a cover load
+        TrackTable._last_push_time = 0.0
+        CoverWidget._last_push_time = -1.0
+
+        first_name = folders[0].name
+        extra = len(folders) - 1
+        n_books  = len(all_dirs)
+        n_tracks = sum(len(get_direct_audio(d)) for d, _ in all_dirs)
+        self.drop_zone.set_loaded(first_name, n_books, n_tracks, extra)
         self.btn_create.setText(_tr_create(n_books))
         self.scroll.setVisible(True)
         self._bottom.setVisible(True)
@@ -385,10 +405,12 @@ class MainWindow(QMainWindow):
         for s in self._sections:
             s.stop_worker()
         self._sections.clear()
-        for _, sec, _ in self._sec_undo:
-            sec.deleteLater()
-        for _, sec, _ in self._sec_redo:
-            sec.deleteLater()
+        for _, entries, _ in self._sec_undo:
+            for sec, _, _ in entries:
+                sec.deleteLater()
+        for _, entries, _ in self._sec_redo:
+            for sec, _, _ in entries:
+                sec.deleteLater()
         self._sec_undo.clear()
         self._sec_redo.clear()
         while self._sections_lay.count():
@@ -396,27 +418,33 @@ class MainWindow(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
 
-    def _delete_section(self, section: AudiobookSection, *, from_redo: bool = False):
-        section.stop_worker()
+    def _delete_section(self, section: AudiobookSection):
+        """Called by section.delete_requested signal — removes section and pushes undo."""
+        restore_tracks = getattr(section, '_restore_tracks', None)
+        section._restore_tracks = None
         idx = self._sections.index(section) if section in self._sections else 0
+        self._remove_section_from_ui(section)
+        self._sec_undo.append((time.monotonic(), [(section, idx, restore_tracks)], False))
+        self._sec_redo.clear()
+        self._update_after_sections_change()
+
+    def _remove_section_from_ui(self, section: AudiobookSection):
+        section.stop_worker()
         if section in self._sections:
             self._sections.remove(section)
         section.setParent(None)
         section.hide()
         self._rebuild_separators()
 
-        if not from_redo:
-            self._sec_undo.append((time.monotonic(), section, idx))
-            self._sec_redo.clear()
-
-        if not self._sections:
-            self.scroll.setVisible(False)
-            self._bottom.setVisible(False)
-            self.drop_zone.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            self._fit_window()
-        else:
-            self.btn_create.setText(_tr_create(len(self._sections)))
-            self._fit_window()
+    def _restore_section_to_ui(self, section: AudiobookSection, idx: int,
+                                restore_tracks: "list | None"):
+        self._sections.insert(idx, section)
+        self._rebuild_separators()
+        section.show()
+        if restore_tracks is not None:
+            section.table._tracks = restore_tracks
+            section._restore_tracks = None
+            section.table._rebuild()
 
     def _rebuild_separators(self):
         sb = self.scroll.verticalScrollBar()
@@ -435,6 +463,30 @@ class MainWindow(QMainWindow):
             self._sections_lay.addWidget(s)
         sb.setValue(saved)
 
+    def _on_tracks_changed(self):
+        """Called when tracks are added/removed in any table; updates drop zone count.
+        Note: _after_table_change runs first (connected earlier), so if a section
+        was auto-deleted its removal from self._sections has already happened here."""
+        if not self._sections or self.drop_zone._loaded_name is None:
+            return
+        n_tracks = sum(s.track_count for s in self._sections)
+        self.drop_zone.update_counts(len(self._sections), n_tracks)
+
+    def _update_after_sections_change(self):
+        n = len(self._sections)
+        if n == 0:
+            self.scroll.setVisible(False)
+            self._bottom.setVisible(False)
+            self.drop_zone.reset()
+            self._fit_window()
+        else:
+            n_tracks = sum(s.track_count for s in self._sections)
+            self.drop_zone.update_counts(n, n_tracks)
+            self.btn_create.setText(_tr_create(n))
+            self.scroll.setVisible(True)
+            self._bottom.setVisible(True)
+            self._fit_window()
+
     # ── Undo / Redo ──────────────────────────────────────────────────────────
 
     def _active_table(self) -> "TrackTable | None":
@@ -449,6 +501,21 @@ class MainWindow(QMainWindow):
     def _refresh_undo_actions(self):
         self._act_undo.setText(tr("undo"))
         self._act_redo.setText(tr("redo"))
+
+    def _apply_sec_op(self, stack_from: list, stack_to: list):
+        """Shared logic for undo/redo of section-level operations."""
+        ts, entries, in_ui = stack_from.pop()
+        if in_ui:
+            # Sections are in UI → remove them all
+            for section, idx, _ in entries:
+                self._remove_section_from_ui(section)
+            stack_to.append((time.monotonic(), entries, False))
+        else:
+            # Sections are hidden → restore them all
+            for section, idx, restore_tracks in entries:
+                self._restore_section_to_ui(section, idx, restore_tracks)
+            stack_to.append((time.monotonic(), entries, True))
+        self._update_after_sections_change()
 
     def _undo(self):
         fw = QApplication.focusWidget()
@@ -466,16 +533,7 @@ class MainWindow(QMainWindow):
         if cov_time == latest:
             cover.undo()
         elif sec_time == latest:
-            ts, section, idx = self._sec_undo.pop()
-            self._sec_redo.append((ts, section, idx))
-            self._sections.insert(idx, section)
-            self._rebuild_separators()
-            section.show()
-            self.btn_create.setText(_tr_create(len(self._sections)))
-            self.scroll.setVisible(True)
-            self._bottom.setVisible(True)
-            self.drop_zone.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            self._fit_window()
+            self._apply_sec_op(self._sec_undo, self._sec_redo)
         else:
             table.undo()
 
@@ -495,9 +553,7 @@ class MainWindow(QMainWindow):
         if cov_time == latest:
             cover.redo()
         elif sec_time == latest:
-            _, section, idx = self._sec_redo.pop()
-            self._delete_section(section, from_redo=True)
-            self._sec_undo.append((time.monotonic(), section, idx))
+            self._apply_sec_op(self._sec_redo, self._sec_undo)
         else:
             table.redo()
 

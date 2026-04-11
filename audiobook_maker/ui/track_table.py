@@ -123,6 +123,16 @@ class TrackTable(QTableWidget):
     @property
     def can_redo(self) -> bool: return bool(self._redo_stack)
 
+    def take_last_undo_snapshot(self) -> "list[dict] | None":
+        """Pop and return the last undo snapshot, resetting push time if stack empties."""
+        if not self._undo_stack:
+            return None
+        snap = self._undo_stack.pop()
+        self._redo_stack.clear()
+        if not self._undo_stack:
+            TrackTable._last_push_time = 0.0
+        return snap
+
     def remove_selected(self):
         rows = sorted({i.row() for i in self.selectedIndexes()}, reverse=True)
         if not rows:
